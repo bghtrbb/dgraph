@@ -227,17 +227,20 @@ func runSchemaMutation(ctx context.Context, updates []*pb.SchemaUpdate, startTs 
 	}
 
 	var closer *z.Closer
+	var rebuildList []posting.IndexRebuild
+	var needsIndexing bool
+	// We need to travesre twice through the updates. First pass is to see if any of them
+	// needs indexing. If needed then we start opIndexing and then actually build indexes and
+	// update schema in the second pass.
 	for _, su := range updates {
 		if tablet, err := groups().Tablet(su.Predicate); err != nil {
 			return err
 		} else if tablet.GetGroupId() != groups().groupId() {
 			return errors.Errorf("Tablet isn't being served by this group. Tablet: %+v", tablet)
 		}
-
 		if err := checkSchema(su); err != nil {
 			return err
 		}
-
 		old, ok := schema.State().Get(ctx, su.Predicate)
 		rebuild := posting.IndexRebuild{
 			Attr:          su.Predicate,
@@ -245,17 +248,21 @@ func runSchemaMutation(ctx context.Context, updates []*pb.SchemaUpdate, startTs 
 			OldSchema:     &old,
 			CurrentSchema: su,
 		}
-		shouldRebuild := ok && rebuild.NeedIndexRebuild()
+		rebuildList = append(rebuildList, rebuild)
+		needsIndexing = needsIndexing || ok && rebuild.NeedIndexRebuild()
 
-		// Start opIndexing task only if schema update needs to build the indexes.
-		if shouldRebuild && !gr.Node.isRunningTask(opIndexing) {
-			closer, err = gr.Node.startTask(opIndexing)
-			if err != nil {
-				return err
-			}
-			defer stopIndexing(closer)
+	}
+	// Start opIndexing task only if schema update needs to build the indexes.
+	if needsIndexing && !gr.Node.isRunningTask(opIndexing) {
+		closer, err = gr.Node.startTask(opIndexing)
+		if err != nil {
+			return err
 		}
+		defer stopIndexing(closer)
+	}
 
+	for i, su := range updates {
+		rebuild := rebuildList[i]
 		querySchema := rebuild.GetQuerySchema()
 		// Sets the schema only in memory. The schema is written to
 		// disk only after schema mutations are successful.
@@ -264,7 +271,7 @@ func runSchemaMutation(ctx context.Context, updates []*pb.SchemaUpdate, startTs 
 
 		// TODO(Aman): If we return an error, we may not have right schema reflected.
 		setup := func() error {
-			if !ok {
+			if rebuild.OldSchema != nil {
 				return nil
 			}
 			if err := rebuild.DropIndexes(ctx); err != nil {
@@ -278,7 +285,7 @@ func runSchemaMutation(ctx context.Context, updates []*pb.SchemaUpdate, startTs 
 			return err
 		}
 
-		if shouldRebuild {
+		if rebuild.OldSchema != nil && rebuild.NeedIndexRebuild() {
 			go buildIndexes(su, rebuild, closer)
 		} else if err := updateSchema(su); err != nil {
 			return err
